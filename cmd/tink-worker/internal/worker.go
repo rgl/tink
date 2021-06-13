@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"bufio"
 	"context"
 	sha "crypto/sha256"
 	"encoding/base64"
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/packethost/pkg/log"
 	"github.com/pkg/errors"
@@ -76,32 +74,14 @@ func NewWorker(client pb.WorkflowServiceClient, regConn *RegistryConnDetails, lo
 	}
 }
 
-func (w *Worker) captureLogs(ctx context.Context, id string) {
-	reader, err := w.registryClient.ContainerLogs(ctx, id, types.ContainerLogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     true,
-		Timestamps: false,
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer reader.Close()
-
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		fmt.Println(scanner.Text())
-	}
-}
-
-func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAction, captureLogs bool) (pb.State, error) {
+func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAction) (pb.State, error) {
 	l := w.logger.With("workflowID", wfID, "workerID", action.GetWorkerId(), "actionName", action.GetName(), "actionImage", action.GetImage())
 
 	cli := w.registryClient
 	if err := w.regConn.pullImage(ctx, cli, action.GetImage()); err != nil {
 		return pb.State_STATE_RUNNING, errors.Wrap(err, "DOCKER PULL")
 	}
-	id, err := w.createContainer(ctx, action.Command, wfID, action, captureLogs)
+	id, err := w.createContainer(ctx, action.Command, wfID, action)
 	if err != nil {
 		return pb.State_STATE_RUNNING, errors.Wrap(err, "DOCKER CREATE")
 	}
@@ -124,11 +104,6 @@ func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAc
 
 	failedActionStatus := make(chan pb.State)
 
-	if captureLogs {
-		// capturing logs of action container in a go-routine
-		go w.captureLogs(ctx, id)
-	}
-
 	status, waitErr := waitContainer(timeCtx, cli, id)
 	defer func() {
 		if removalErr := removeContainer(ctx, l, cli, id); removalErr != nil {
@@ -143,15 +118,12 @@ func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAc
 	l.With("status", status.String()).Info("container removed")
 	if status != pb.State_STATE_SUCCESS {
 		if status == pb.State_STATE_TIMEOUT && action.OnTimeout != nil {
-			id, err = w.createContainer(ctx, action.OnTimeout, wfID, action, captureLogs)
+			id, err = w.createContainer(ctx, action.OnTimeout, wfID, action)
 			if err != nil {
 				l.Error(errors.Wrap(err, errCreateContainer))
 			}
 			l.With("containerID", id, "status", status.String(), "command", action.GetOnTimeout()).Info("container created")
 			failedActionStatus := make(chan pb.State)
-			if captureLogs {
-				go w.captureLogs(ctx, id)
-			}
 			go waitFailedContainer(ctx, l, cli, id, failedActionStatus)
 			err = startContainer(ctx, l, cli, id)
 			if err != nil {
@@ -161,14 +133,11 @@ func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAc
 			l.With("status", onTimeoutStatus).Info("action timeout")
 		} else {
 			if action.OnFailure != nil {
-				id, err = w.createContainer(ctx, action.OnFailure, wfID, action, captureLogs)
+				id, err = w.createContainer(ctx, action.OnFailure, wfID, action)
 				if err != nil {
 					l.Error(errors.Wrap(err, errFailedToRunCmd))
 				}
 				l.With("containerID", id, "actionStatus", status.String(), "command", action.GetOnFailure()).Info("container created")
-				if captureLogs {
-					go w.captureLogs(ctx, id)
-				}
 				go waitFailedContainer(ctx, l, cli, id, failedActionStatus)
 				err = startContainer(ctx, l, cli, id)
 				if err != nil {
@@ -188,7 +157,7 @@ func (w *Worker) execute(ctx context.Context, wfID string, action *pb.WorkflowAc
 }
 
 // ProcessWorkflowActions gets all Workflow contexts and processes their actions
-func (w *Worker) ProcessWorkflowActions(ctx context.Context, workerID string, captureActionLogs bool) error {
+func (w *Worker) ProcessWorkflowActions(ctx context.Context, workerID string) error {
 	l := w.logger.With("workerID", workerID)
 
 	for {
@@ -298,7 +267,7 @@ func (w *Worker) ProcessWorkflowActions(ctx context.Context, workerID string, ca
 
 				// start executing the action
 				start := time.Now()
-				status, err := w.execute(ctx, wfID, action, captureActionLogs)
+				status, err := w.execute(ctx, wfID, action)
 				elapsed := time.Since(start)
 
 				actionStatus := &pb.WorkflowActionStatus{
